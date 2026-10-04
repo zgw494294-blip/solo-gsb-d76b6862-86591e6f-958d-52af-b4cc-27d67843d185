@@ -111,6 +111,9 @@ function clearOutcome() {
 
 function onInputChanged() {
   inputVersion += 1;
+  // 绑定值一变就立即丢弃对应复核：不等待防抖提交或合法裁决响应，
+  // 输入非法、防抖等待、请求在途时同样生效，改回原值也不会恢复。
+  pruneReviewsForCurrentInput();
   clearOutcome();
   pendingHint.hidden = false;
   if (debounceTimer) clearTimeout(debounceTimer);
@@ -222,6 +225,89 @@ function lapReviewKey(runner, lap, standards) {
     lap.mfTime,
     standards,
   ]);
+}
+
+// 复核键各部分的下标（与 lapReviewKey 写入顺序一致，数组为扁平结构）：
+// [runner, [S记录id,"S",time], [M记录...], [F记录...], smTime, mfTime, standards]
+const KEY_RUNNER = 0;
+const KEY_S_RECORD = 1;
+const KEY_M_RECORD = 2;
+const KEY_F_RECORD = 3;
+const KEY_STANDARDS = 6; // [smMin, smMax, mfMin, mfMax]
+
+// 在每次输入变更时同步调用：只依据当前表单内容校验每条复核的绑定值，
+// 不依赖任何裁决响应。任一绑定值改变（或绑定选手、记录被删除）立即丢弃；
+// 仅与绑定无关的改动（重排记录行、增删改其他记录）不影响复核保留。
+function pruneReviewsForCurrentInput() {
+  if (reviews.size === 0) return;
+
+  const currentStandards = ["smMin", "smMax", "mfMin", "mfMax"].map((id) =>
+    Number(document.getElementById(id).value.trim())
+  );
+
+  const runnerNumbers = new Set(
+    [...runnerRows.querySelectorAll(".runner-number")]
+      .map((el) => Number(el.value.trim()))
+      .filter((n) => Number.isFinite(n))
+  );
+
+  // 以记录 ID 为索引定位当前记录（记录可以乱序、可重排行，不按行号绑定）。
+  const recordsById = new Map();
+  for (const row of recordRows.querySelectorAll(".record-row")) {
+    const idEl = row.querySelector(".rec-id");
+    const id = idEl.value.trim();
+    if (id !== "") {
+      recordsById.set(id, {
+        runner: Number(row.querySelector(".rec-runner").value.trim()),
+        gate: row.querySelector(".rec-gate").value,
+        time: Number(row.querySelector(".rec-time").value.trim()),
+      });
+    }
+  }
+
+  for (const key of [...reviews.keys()]) {
+    let parts;
+    try {
+      parts = JSON.parse(key);
+    } catch {
+      reviews.delete(key);
+      continue;
+    }
+    const boundRunner = parts[KEY_RUNNER];
+    const boundRecords = [parts[KEY_S_RECORD], parts[KEY_M_RECORD], parts[KEY_F_RECORD]];
+    const boundStandards = parts[KEY_STANDARDS];
+
+    // 两段耗时区间改变（含清空后处于非法输入）：立即丢弃全部相关复核。
+    if (
+      !Array.isArray(boundStandards) ||
+      boundStandards.length !== currentStandards.length ||
+      boundStandards.some((v, i) => v !== currentStandards[i])
+    ) {
+      reviews.delete(key);
+      continue;
+    }
+    // 绑定的选手被删除或编号被改掉：立即丢弃。
+    if (!runnerNumbers.has(boundRunner)) {
+      reviews.delete(key);
+      continue;
+    }
+    // 三条绑定记录任一条被删除，或其门/秒数/归属选手发生改变：立即丢弃。
+    const stillBound =
+      Array.isArray(boundRecords) &&
+      boundRecords.length === 3 &&
+      boundRecords.every(([id, gate, time]) => {
+        const cur = recordsById.get(id);
+        return (
+          cur &&
+          Number.isFinite(cur.runner) &&
+          cur.runner === boundRunner &&
+          cur.gate === gate &&
+          Number.isFinite(cur.time) &&
+          cur.time === time
+        );
+      });
+    if (!stillBound) reviews.delete(key);
+  }
 }
 
 function reviewCurrentText(saved) {

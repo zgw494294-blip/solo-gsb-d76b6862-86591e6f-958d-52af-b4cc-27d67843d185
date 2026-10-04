@@ -111,6 +111,8 @@ function clearOutcome() {
 
 function onInputChanged() {
   inputVersion += 1;
+  // 先按当前输入即时丢弃绑定已失效的复核：不必、也不能等到合法裁决返回。
+  pruneReviewsByBindings();
   clearOutcome();
   pendingHint.hidden = false;
   if (debounceTimer) clearTimeout(debounceTimer);
@@ -224,6 +226,92 @@ function lapReviewKey(runner, lap, standards) {
   ]);
 }
 
+// 即时剪枝：任一绑定值改变、绑定记录或选手被删除（含当前输入非法、尚在防抖、
+// 请求在途的情形），对应复核此刻就丢弃；之后改回或过期响应返回也不会恢复。
+// 只逐条核对绑定本身：重排记录、增删改无关记录的趟不受影响，保留原状态与备注。
+function pruneReviewsByBindings() {
+  const standards = currentStandards();
+
+  const runnerNumbers = new Set(
+    [...runnerRows.querySelectorAll(".runner-number")]
+      .map((el) => el.value.trim())
+      .filter((v) => v !== "")
+      .map(Number)
+  );
+
+  // 以记录 ID 为索引：绑定按 ID 定位，ID 缺失即记录被删除；
+  // 同一 ID 出现多行时无法唯一定位原记录，同样视为绑定失效。
+  const recordsById = new Map();
+  const duplicatedIds = new Set();
+  for (const row of recordRows.querySelectorAll(".record-row")) {
+    const id = row.querySelector(".rec-id").value.trim();
+    if (id === "") continue;
+    if (recordsById.has(id)) {
+      duplicatedIds.add(id);
+      continue;
+    }
+    recordsById.set(id, {
+      runner: row.querySelector(".rec-runner").value.trim(),
+      gate: row.querySelector(".rec-gate").value,
+      time: row.querySelector(".rec-time").value.trim(),
+    });
+  }
+
+  const intText = (v) => (/^\d+$/.test(v) ? Number(v) : NaN);
+  const recordMatches = (rec, gate, time) =>
+    rec !== undefined &&
+    rec.gate === gate &&
+    intText(rec.time) === time;
+
+  for (const key of [...reviews.keys()]) {
+    let parts;
+    try {
+      parts = JSON.parse(key);
+    } catch (err) {
+      reviews.delete(key); // 结构不符的键一律视为失效
+      continue;
+    }
+    const [
+      runner,
+      [sId, sGate, sTime],
+      [mId, mGate, mTime],
+      [fId, fGate, fTime],
+      smTime,
+      mfTime,
+      boundStandards,
+    ] = parts;
+
+    let valid =
+      JSON.stringify(boundStandards) === JSON.stringify(standards) &&
+      runnerNumbers.has(runner) &&
+      !duplicatedIds.has(sId) &&
+      !duplicatedIds.has(mId) &&
+      !duplicatedIds.has(fId) &&
+      sId !== mId &&
+      sId !== fId &&
+      mId !== fId &&
+      recordMatches(recordsById.get(sId), sGate, sTime) &&
+      recordMatches(recordsById.get(mId), mGate, mTime) &&
+      recordMatches(recordsById.get(fId), fGate, fTime);
+
+    if (valid) {
+      // 绑定记录的选手编号必须仍是该选手；门/秒数不变时两段耗时自然不变，
+      // 这里仍显式核对一次，避免任何不一致的键残留。
+      const sRec = recordsById.get(sId);
+      const mRec = recordsById.get(mId);
+      const fRec = recordsById.get(fId);
+      valid =
+        intText(sRec.runner.trim()) === runner &&
+        intText(mRec.runner.trim()) === runner &&
+        intText(fRec.runner.trim()) === runner &&
+        mTime - sTime === smTime &&
+        fTime - mTime === mfTime;
+    }
+
+    if (!valid) reviews.delete(key);
+  }
+}
+
 function reviewCurrentText(saved) {
   const status = saved ? saved.status : "pending";
   const note = saved ? saved.note : "";
@@ -301,7 +389,9 @@ function renderResults(result) {
   const standards = currentStandards();
   const keyOf = (runner, lap) => lapReviewKey(runner, lap, standards);
 
-  // 最新合法裁决不再采纳的趟（含任一绑定值改变的趟）：丢弃其复核，改回也不恢复。
+  // 合法裁决到达后再按最新采纳集合剪枝：处理“绑定本身没变、但该趟不再被最新
+  // 合法裁决采纳”的情形；绑定值改变/记录或选手删除已在输入变更瞬间即时丢弃，
+  // 过期响应因版本号守卫根本到不了这里，无法恢复被丢弃的复核。
   const adopted = new Set();
   for (const r of result.runners) {
     for (const lap of r.laps) adopted.add(keyOf(r.runner, lap));
